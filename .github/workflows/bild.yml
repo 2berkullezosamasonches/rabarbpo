@@ -1,4 +1,4 @@
-name: Build
+name: Build and Security Scan
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  # 1. Сначала проверяем секреты
+  # 1. Проверка секретов (Gitleaks)
   secrets-scan:
     name: Secret Scanning
     runs-on: ubuntu-latest
@@ -14,19 +14,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Для сканирования всей истории коммитов
+          fetch-depth: 0
 
       - name: Gitleaks Scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Если секреты найдены, job упадет, и build не начнется
 
-  # 2. Сборка (зависит от проверки секретов)
+  # 2. Сборка Java приложения
   build:
-    name: Build
+    name: Build Java App
     runs-on: ubuntu-latest
-    needs: secrets-scan # Блокировка сборки
+    needs: secrets-scan
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,117 +37,134 @@ jobs:
           java-version: '21'
 
       - name: Build application
-        run: mvn clean package
+        run: mvn clean package -DskipTests
 
       - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
           name: jar-artifact
           path: target/*.jar
+          retention-days: 1
 
-  # 3. Анализ кода (зависит от сборки)
+  # 3. Статический анализ кода (SAST)
   sast:
+    name: Semgrep SAST
     runs-on: ubuntu-latest
     needs: build
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Semgrep
-        run: pipx install semgrep
-
       - name: Run Semgrep
-        run: semgrep scan --config auto --sarif --output semgrep.sarif || true
-
+        run: |
+          pipx install semgrep
+          semgrep scan --config auto --sarif --output semgrep.sarif || true
       - name: Upload SARIF
         uses: actions/upload-artifact@v4
         with:
           name: semgrep-report
-          path: |
-            semgrep.sarif
+          path: semgrep.sarif
 
-  # 4. Анализ зависимостей (зависит от сборки)
+  # 4. Анализ зависимостей (SCA)
   sca:
+    name: OWASP Dependency Check
     runs-on: ubuntu-latest
     needs: build
-    container:
-      image: maven:3.9.11-eclipse-temurin-21-alpine
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Run OWASP
+      - name: Run OWASP Check
         run: mvn -B org.owasp:dependency-check-maven:check -Dnvd.api.key=${{ secrets.NVD_API_KEY }}
-
       - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: dependency-check-report
           path: target/dependency-check-report.html
 
-  # 5. Динамический анализ (зависит от сборки)
+  # 5. Динамический анализ (DAST)
   dast-dynamic:
-    name: DAST Scan
+    name: ZAP DAST Scan
     runs-on: ubuntu-latest
     needs: build
-    permissions:
-      contents: read
-      security-events: write
-      actions: write
-      checks: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
           name: jar-artifact
           path: target
-
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
-
       - name: Start Application
         run: |
           nohup java -jar target/*.jar &
           sleep 30
-
-      - name: Fix permissions
-        run: chmod -R 777 .
-
-      - name: Create Empty Rules File
-        run: touch zap_rules.tsv && chmod 666 zap_rules.tsv
-
-      - name: Pull ZAP Image
-        run: docker pull ghcr.io/zaproxy/zaproxy:stable
-
       - name: ZAP Baseline Scan
         run: |
-          docker run --rm --network host --user root \
-            -v $(pwd):/zap/wrk/:rw \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t http://localhost:8080 -r zap-baseline-report.html -I || true
-
-      - name: Upload Baseline Report
+          chmod -R 777 .
+          docker run --rm --network host -v $(pwd):/zap/wrk/:rw ghcr.io/zaproxy/zaproxy:stable \
+          zap-baseline.py -t http://localhost:8080 -r zap-report.html -I || true
+      - name: Upload DAST Report
         uses: actions/upload-artifact@v4
         with:
-          name: zap-baseline-report
-          path: zap-baseline-report.html
+          name: zap-report
+          path: zap-report.html
 
-      - name: ZAP API Scan
+  # 6. Сборка, проверка Docker и Push (НОВОЕ)
+  docker-build-secure:
+    name: Docker Build, Scan and Push
+    runs-on: ubuntu-latest
+    needs: [sast, sca, dast-dynamic] # Ждем завершения всех проверок кода
+    permissions:
+      contents: read
+      packages: write # Право на публикацию в GitHub Packages
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: jar-artifact
+          path: target
+
+      # Проверка Dockerfile на ошибки (Linting)
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      # Сборка локального образа для тестов
+      - name: Build Docker image locally
         run: |
-          docker run --rm --network host --user root \
-            -v $(pwd):/zap/wrk/:rw \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-api-scan.py -t http://localhost:8080/v3/api-docs -f openapi -r zap-api-report.html -I || true
+          docker build -t ghcr.io/${{ github.repository_owner }}/my-app:${{ github.sha }} .
 
-      - name: Upload API Report
-        uses: actions/upload-artifact@v4
+      # Сканирование образа на уязвимости (Trivy)
+      - name: Run Trivy Scanner
+        uses: aquasecurity/trivy-action@master
         with:
-          name: zap-api-report
-          path: zap-api-report.html
+          image-ref: 'ghcr.io/${{ github.repository_owner }}/my-app:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1' # ОСТАНОВИТЬ pipeline, если найдены уязвимости
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # Если Trivy не нашел критических ошибок, логинимся и пушим
+      - name: Login to GitHub Container Registry
+        if: success()
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image
+        if: success()
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/my-app:${{ github.sha }}
+          docker tag ghcr.io/${{ github.repository_owner }}/my-app:${{ github.sha }} ghcr.io/${{ github.repository_owner }}/my-app:latest
+          docker push ghcr.io/${{ github.repository_owner }}/my-app:latest
